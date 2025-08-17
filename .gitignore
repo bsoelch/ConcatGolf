@@ -1,0 +1,9 @@
+main
+atoms.txt
+in.txt
+tokens.txt
+*.zip
+*.out
+*.o
+*.s
+*.ll
