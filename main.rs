@@ -115,16 +115,15 @@ fn tokenize<'a>(input: &'a str) -> Vec<Token<'a>> {
 }
 
 // parser
-#[derive(Debug,Clone,Copy)]
-enum StackOp{
-    Over(u32),
-    Under(u32),
-    Rotate(i32), // positive: rotate n-th element to top, negative: rotate top-element down to pos n
-    Drop(u32), // discard up to n values
-}
-
+#[allow(non_camel_case_types)]
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
 enum BuiltIn {
+    DUP, DUP2,
+    OVER, OVER2, OVER_N, UNDER,
+    SWAP, SWAP2, ROT2, ROT_2, ROT3, ROT_3, ROT_N,
+    DROP, DROP2, DROP_N,
+    // TODO? more stack manipulators ? 'nip' (discard elements below top value)
+
     NEGATE,
     ADD,
     SUBTRACT,
@@ -140,6 +139,8 @@ enum BuiltIn {
     
     LEN,
     COLLECT,
+    COLLECT1,
+    COLLECT2,
     SPLAT,
 
     IF,
@@ -149,7 +150,25 @@ enum BuiltIn {
 
     CALL,
 }
-const BUILTIN_WORDS: [(&str,BuiltIn); 32] = [
+const BUILTIN_WORDS: [(&str,BuiltIn); 51] = [
+    // stack manipulation
+    ("dup", BuiltIn::DUP),
+    ("dup2", BuiltIn::DUP2),
+    ("over", BuiltIn::OVER),
+    ("over2", BuiltIn::OVER2),
+    ("over3", BuiltIn::OVER2),
+    ("over*", BuiltIn::OVER_N),
+    ("under", BuiltIn::UNDER),
+    ("swap", BuiltIn::SWAP),
+    ("swap2", BuiltIn::SWAP2),
+    ("rot2", BuiltIn::ROT2),
+    ("rot-2", BuiltIn::ROT_2),
+    ("rot3", BuiltIn::ROT3),
+    ("rot-3", BuiltIn::ROT_3),
+    ("rot*", BuiltIn::ROT_N),
+    ("drop", BuiltIn::DROP),
+    ("drop2", BuiltIn::DROP2),
+    ("drop*", BuiltIn::DROP_N),
     // arithmetic operators
     ("-_", BuiltIn::NEGATE),
     ("negate", BuiltIn::NEGATE),
@@ -176,6 +195,8 @@ const BUILTIN_WORDS: [(&str,BuiltIn); 32] = [
     // lists
     ("len", BuiltIn::LEN),
     ("collect", BuiltIn::COLLECT),
+    ("collect1", BuiltIn::COLLECT1),
+    ("collect2", BuiltIn::COLLECT2),
     ("...", BuiltIn::SPLAT),
     ("splat", BuiltIn::SPLAT),
     // control flow
@@ -213,7 +234,6 @@ fn builtin_name(built_in: &BuiltIn) -> Option<&'static str> {
 enum Atom<'a> {
     BuiltInWord(BuiltIn),
     Number(f64), // TODO? use arbitary pression library for numbers (? rug crate )
-    StackOp(StackOp),
     Assign(&'a str),
     Get(&'a str),
     String(&'a str),
@@ -227,14 +247,6 @@ fn dump_atoms<'a>(out_file: &mut fs::File, atoms: &'a [Atom<'a>],indent: usize)-
             }
             Atom::Number(value) => {
                 writeln!(out_file,"{}Number({})","   ".repeat(indent),value)?;
-            }
-            Atom::StackOp(stack_op) => {
-                match stack_op {
-                  StackOp::Over(index) => {writeln!(out_file,"{}Over({})","   ".repeat(indent),index)?;}
-                  StackOp::Under(index) => {writeln!(out_file,"{}Under({})","   ".repeat(indent),index)?;}
-                  StackOp::Rotate(index) => {writeln!(out_file,"{}Rotate({})","   ".repeat(indent),index)?;}
-                  StackOp::Drop(index) => {writeln!(out_file,"{}Drop({})","   ".repeat(indent),index)?;}
-                }
             }
             Atom::String(value) => { // TODO? escaping
                 writeln!(out_file,"{}String({})","   ".repeat(indent),value.to_string())?;
@@ -265,43 +277,6 @@ fn try_parse_atom<'a>(mut tokens: &'a [Token<'a>]) -> Result<(Atom<'a>,usize),&'
                 // TODO support non-integer numbers
                 if let Ok(value) = word.parse::<f64>() {
                     return Ok((Atom::Number(value),1))
-                } else {
-                    return Err(&tokens[0])
-                }
-            } else if word == "dup" {
-                return Ok((Atom::StackOp(StackOp::Over(0)),1))
-            } else if word == "swap" {
-                return Ok((Atom::StackOp(StackOp::Rotate(1)),1))
-            } else if word == "drop" || word.starts_with("drop") &&
-                    word[4..].chars().next().unwrap().is_digit(10) {
-                let count_or_err = if word.len() == 4 {Result::Ok(1)} else {(&word[4..]).parse::<u32>()};
-                if let Ok(count) = count_or_err {
-                    return Ok((Atom::StackOp(StackOp::Drop(count)),1))
-                } else {
-                    return Err(&tokens[0])
-                }
-            } else if word == "over" || word.starts_with("over") &&
-                    word[4..].chars().next().unwrap().is_digit(10) {
-                let offset_or_err = if word.len() == 4 {Result::Ok(1)} else {(&word[4..]).parse::<u32>()};
-                if let Ok(offset) = offset_or_err {
-                    return Ok((Atom::StackOp(StackOp::Over(offset)),1))
-                } else {
-                    return Err(&tokens[0])
-                }
-            } else if word == "under" || word.starts_with("under") &&
-                    word[5..].chars().next().unwrap().is_digit(10) {
-                let offset_or_err = if word.len() == 5 {Result::Ok(1)} else {(&word[5..]).parse::<u32>()};
-                if let Ok(offset) = offset_or_err {
-                    return Ok((Atom::StackOp(StackOp::Under(offset)),1))
-                } else {
-                    return Err(&tokens[0])
-                }
-            } else if word == "rot" || (word.starts_with("rot") &&
-                    word[3..].chars().next().unwrap().is_digit(10)) || (word.starts_with("rot-") &&
-                    word[4..].chars().next().unwrap().is_digit(10)) {
-                let count_or_err = if word.len() == 3 {Result::Ok(2)} else {(&word[3..]).parse::<i32>()};
-                if let Ok(count) = count_or_err {
-                    return Ok((Atom::StackOp(StackOp::Rotate(count)),1))
                 } else {
                     return Err(&tokens[0])
                 }
@@ -463,8 +438,153 @@ fn as_iter(val : Value) -> ValueIterator {
     };
 }
 
+fn stack_copy<'a>(stack: &mut Vec<Value<'a>>,count: i64) {
+    if count >= 0 {
+        let offset = (count + 1) as usize;
+        let val = if stack.len() >= offset {
+            stack[stack.len() - offset].clone()
+        }else {
+            Value::default()
+        };
+        stack.push(val);
+    } else {
+        let offset = (1 - count) as usize;
+        let val = stack.last().map(|v|v.clone()).unwrap_or_default();
+        while stack.len() < offset {
+            stack.insert(0,Value::default());
+        }
+        stack.insert(stack.len() - offset,val);
+    }
+}
+fn stack_rot<'a>(stack: &mut Vec<Value<'a>>,count: i64) {
+    if count == 0 {return;}
+    if count > 0 {
+        let offset = count as usize + 1;
+        let src = if offset > stack.len() {
+            Value::default()
+        } else {
+            stack.remove(stack.len() - offset)
+        };
+        stack.push(src)
+    } else {
+        let offset = -count as usize;
+        let src = stack.pop().unwrap_or_default();
+        while stack.len() < offset {
+            stack.insert(0,Value::default());
+        }
+        stack.insert(stack.len() - offset,src);
+    }
+}
+/*
+if count is positive the top count elements are discarded
+if count is negative the top -count elements are copied
+*/
+fn stack_drop_or_dup<'a>(stack: &mut Vec<Value<'a>>,count: i64) {
+    if count >= 0 {
+        for _ in 0..count {
+            stack.pop();
+        }
+    } else {
+        let offset = (-count) as usize;
+        while stack.len() < offset {
+            stack.insert(0,Value::default());
+        }
+        for i in stack.len() - offset..(stack.len()) {
+            stack.push(stack[i].clone())
+        }
+    }
+}
+fn op_collect<'a>(stack: &mut Vec<Value<'a>>,count: i64) {
+    let elt_count = count.abs() as usize;
+    let mut elts = Vec::with_capacity(elt_count);
+    if elt_count <= stack.len() {
+        elts.extend_from_slice(&stack[(stack.len() - elt_count)..]);
+    } else {
+        elts.extend(std::iter::repeat(Value::default()).take(elt_count-stack.len()));
+        elts.extend_from_slice(&stack);
+    }
+    stack.truncate(stack.len().saturating_sub(elt_count));
+    if count < 0 {
+        elts.reverse();
+    }
+    stack.push(Value::List(elts));
+}
+
 fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a str,Value<'a>>) {
     match built_in {
+        BuiltIn::DUP => {
+            stack_copy(stack,0);
+        }
+        BuiltIn::DUP2 => {
+            stack_drop_or_dup(stack,-2);
+        }
+        BuiltIn::OVER => {
+            stack_copy(stack,1);
+        }
+        BuiltIn::OVER2 => {
+            stack_copy(stack,2);
+        }
+        BuiltIn::UNDER => {
+            stack_copy(stack,-1);
+        }
+        BuiltIn::OVER_N => {
+            let count = stack.pop().unwrap_or_default();
+            match count {
+                Value::Number(num) => {
+                    stack_copy(stack,num.round() as i64);
+                }
+                Value::String(_val) => {panic!("unimplemented")}
+                Value::List(_elts) => {panic!("unimplemented")}
+                Value::Quotation(_body) => {panic!("unimplemented")}
+            }
+        }
+        BuiltIn::SWAP => {
+            stack_rot(stack,1);
+        }
+        BuiltIn::SWAP2 => {
+            stack_rot(stack,3);
+            stack_rot(stack,3);
+        }
+        BuiltIn::ROT2 => {
+            stack_rot(stack,2);
+        }
+        BuiltIn::ROT_2 => {
+            stack_rot(stack,-2);
+        }
+        BuiltIn::ROT3 => {
+            stack_rot(stack,3);
+        }
+        BuiltIn::ROT_3 => {
+            stack_rot(stack,-3);
+        }
+        BuiltIn::ROT_N => {
+            let count = stack.pop().unwrap_or_default();
+            match count {
+                Value::Number(num) => {
+                    stack_rot(stack,num.round() as i64);
+                }
+                Value::String(_val) => {panic!("unimplemented")}
+                Value::List(_elts) => {panic!("unimplemented")}
+                Value::Quotation(_body) => {panic!("unimplemented")}
+            }
+        }
+        BuiltIn::DROP => {
+            stack_drop_or_dup(stack,1);
+        }
+        BuiltIn::DROP2 => {
+            stack_drop_or_dup(stack,2);
+        }
+        BuiltIn::DROP_N => {
+            let count = stack.pop().unwrap_or_default();
+            match count {
+                Value::Number(num) => {
+                    stack_drop_or_dup(stack,num.round() as i64);
+                }
+                Value::String(_val) => {panic!("unimplemented")}
+                Value::List(_elts) => {panic!("unimplemented")}
+                Value::Quotation(_body) => {panic!("unimplemented")}
+            }
+        }
         BuiltIn::ADD => {
             let right = stack.pop().unwrap_or_default();
             let left = stack.pop().unwrap_or_default();
@@ -491,27 +611,21 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
             };
             stack.push(Value::Number(length));
         }
+        BuiltIn::COLLECT1 => {
+            op_collect(stack,1);
+        }
+        BuiltIn::COLLECT2 => {
+            op_collect(stack,2);
+        }
         BuiltIn::COLLECT => {
             let size = stack.pop().unwrap_or_default();
             match size {
                 Value::Number(num) => {
                     let count = num as i64;//TODO? rounding
-                    let elt_count = count.abs() as usize;
-                    let mut elts = Vec::with_capacity(elt_count);
-                    if elt_count <= stack.len() {
-                        elts.extend_from_slice(&stack[(stack.len() - elt_count)..]);
-                    } else {
-                        elts.extend(std::iter::repeat(Value::default()).take(elt_count-stack.len()));
-                        elts.extend_from_slice(&stack);
-                    }
-                    stack.truncate(stack.len().saturating_sub(elt_count));
-                    if count < 0 {
-                        elts.reverse();
-                    }
-                    stack.push(Value::List(elts));
+                    op_collect(stack,count);
                 } 
-                Value::String(val) => {panic!("collect count cannot be a list");}
-                Value::List(elts) => {panic!("collect count cannot be a list");}
+                Value::String(_val) => {panic!("collect count cannot be a list");}
+                Value::List(_elts) => {panic!("collect count cannot be a list");}
                 Value::Quotation(_body) => {
                     panic!("collect count cannot be a quotation");
                 }
@@ -565,51 +679,6 @@ fn eval_block<'a>(atoms: &'a [Atom<'a>],stack: &mut Vec<Value<'a>>,globals: &mut
             }
             Atom::Quotation(body) => {
                 stack.push(Value::Quotation(body))
-            }
-            Atom::StackOp(stack_op) => {
-                match stack_op {
-                    StackOp::Drop(count) => {
-                        for _ in 0..*count {
-                            stack.pop();
-                        }
-                    }
-                    StackOp::Over(count) => {
-                            let offset = *count as usize + 1;
-                            let src = if offset > stack.len() {
-                                Value::default()
-                            } else {
-                                stack.get(stack.len() - offset).unwrap().clone()
-                            };
-                            stack.push(src)
-                    }
-                    StackOp::Under(count) => {
-                        let offset = *count as usize + 1;
-                        let src = stack.last().map(|v|v.clone()).unwrap_or_default();
-                        while stack.len() < offset {
-                            stack.insert(0,Value::default());
-                        }
-                        stack.insert(stack.len() - offset,src);
-                    }
-                    StackOp::Rotate(count) => {
-                        if *count == 0 {return;}
-                        if *count > 0 {
-                            let offset = *count as usize + 1;
-                            let src = if offset > stack.len() {
-                                Value::default()
-                            } else {
-                                stack.remove(stack.len() - offset)
-                            };
-                            stack.push(src)
-                        } else {
-                            let offset = -*count as usize;
-                            let src = stack.pop().unwrap_or_default();
-                            while stack.len() < offset {
-                                stack.insert(0,Value::default());
-                            }
-                            stack.insert(stack.len() - offset,src);
-                        }
-                    }
-                }
             }
             Atom::BuiltInWord(built_in) => {
                 eval_buitlt_in(*built_in,stack,globals);
