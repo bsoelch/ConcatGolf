@@ -55,7 +55,6 @@ impl ToString for Token<'_> {
 }
 
 fn tokenize<'a>(input: &'a [u8]) -> Vec<Token<'a>> {
-    // TODO support strings
     let mut start_index: usize=0;
     let mut line = 1;
     let mut line_pos = 0;
@@ -401,7 +400,6 @@ impl<'a> Iterator for EscapedByteIter<'a> {
                 }
                 return Some(self.encode_utf8(codepoint));
             },
-            // TODO? unicode escape sequences
             _ => return escaped
         }
     }
@@ -541,7 +539,6 @@ fn try_parse_atom<'a>(mut tokens: &'a [Token<'a>]) -> Result<(Atom<'a>,usize),&'
             let word = tokens[0].value;
             if word.len() > 0 && word[0].is_ascii_digit() ||
                 word.len() > 1 && word[0] == b'-' && word[1].is_ascii_digit() {
-                // TODO support non-integer numbers
                 if let Ok(str_val) = str::from_utf8(word) {
                     if let Ok(value) = str_val.parse::<f64>() {
                         return Ok((Atom::Number(value),1))
@@ -655,7 +652,7 @@ fn binary_number_op<'a>(left: &Value<'a>,right: &Value<'a>,f: fn(f64,f64)->Value
 fn eval_call<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a [u8],Value<'a>>) {
     match val {
         Value::Number(_num) => {panic!("cannot call number");} // ? create list with given number of elements
-        Value::ByteString(_val) => {panic!("cannot call string");} // TODO? eval string as code
+        Value::ByteString(_val) => {panic!("cannot call string");}
         Value::List(_elts) => {panic!("cannot call list");} // TODO? call for each element (with current stack)
         Value::Quotation(body) => {
             eval_block(body,stack,globals)
@@ -681,6 +678,7 @@ fn as_bool(val: Value) -> bool {
 
 enum ValueIterator<'a> {
     Number(Range<i64>),
+    NumberRev(std::iter::Rev<Range<i64>>),
     ByteString(EscapedByteIter<'a>),
     List(IntoIter<Value<'a>>),
     Quotation(slice::Iter<'a, Atom<'a>>),
@@ -691,6 +689,7 @@ impl<'a> Iterator for ValueIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             ValueIterator::Number(range) => range.next().map(|i| Value::Number(i as f64)),
+            ValueIterator::NumberRev(range) => range.next().map(|i| Value::Number(i as f64)),
             ValueIterator::ByteString(iter) => iter.next().map(|b|Value::Number(b as f64)),
             ValueIterator::List(iter) => iter.next(),
             ValueIterator::Quotation(iter) => iter.next().map(|x|Value::Quotation(slice::from_ref(x))),
@@ -699,8 +698,13 @@ impl<'a> Iterator for ValueIterator<'a> {
 }
 fn as_iter(val : Value) -> ValueIterator {
     match val {
-        // TODO how to handle negatives
-        Value::Number(num) => return ValueIterator::Number(0..(num as i64)), //TODO? rounding
+        Value::Number(num) => {
+            if num >= 0.0 {
+                return ValueIterator::Number(0..(num.ceil() as i64))
+            } else {
+                return ValueIterator::NumberRev((1..(1-num.ceil() as i64)).rev())
+            }
+        },
         Value::ByteString(msg) => return ValueIterator::ByteString(escaped_byte_iter(msg)),
         Value::List(elts) => return ValueIterator::List(elts.into_iter()),
         Value::Quotation(body) => return ValueIterator::Quotation(body.into_iter()),
@@ -890,8 +894,7 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
             let size = stack.pop().unwrap_or_default();
             match size {
                 Value::Number(num) => {
-                    let count = num as i64;//TODO? rounding
-                    op_collect(stack,count);
+                    op_collect(stack,num.round_ties_even() as i64);
                 } 
                 Value::ByteString(_val) => {panic!("collect count cannot be a list");}
                 Value::List(_elts) => {panic!("collect count cannot be a list");}
@@ -970,8 +973,6 @@ fn run_program<'a>(atoms: &'a [Atom<'a>]) -> Vec<Value<'a>> {
     eval_block(atoms,&mut stack,&mut globals);
     return stack;
 }
-// TODO create interperter
-
 // TODO conversion  atoms <-> id-list <-> byte-stream (multiple encodings for optimizing golfability)
 // optimizations
 // * special cases for blocks or strings of length 1 and 2
