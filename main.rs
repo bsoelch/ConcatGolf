@@ -166,7 +166,7 @@ enum BuiltIn {
     OR,
     XOR,
     NOT,
-    
+
     LEN,
     COLLECT,
     COLLECT1,
@@ -403,6 +403,11 @@ impl<'a> Iterator for EscapedByteIter<'a> {
             _ => return escaped
         }
     }
+    fn size_hint(&self) -> (usize,Option<usize>) {
+        let byte_size = self.byte_iter.size_hint();
+        // worst case: sequence of '\U00000000' will have length 1/10 of original bytes
+        ((byte_size.0+9)/10,byte_size.1)
+    }
 }
 struct EscapedCharIter<'a> {
     byte_iter: EscapedByteIter<'a>
@@ -533,7 +538,7 @@ fn dump_atoms<'a>(out_file: &mut fs::File, atoms: &'a [Atom<'a>],indent: usize)-
     Ok(())
 }
 
-fn try_parse_atom<'a>(mut tokens: &'a [Token<'a>]) -> Result<(Atom<'a>,usize),&'a Token<'a>> {   
+fn try_parse_atom<'a>(mut tokens: &'a [Token<'a>]) -> Result<(Atom<'a>,usize),&'a Token<'a>> {
     match tokens[0].token_type {
         TokenType::Word => {
             let word = tokens[0].value;
@@ -632,23 +637,49 @@ impl ToString for Value<'_> {
         }
     }
 }
-
-fn binary_number_op<'a>(left: &Value<'a>,right: &Value<'a>,f: fn(f64,f64)->Value<'a>) -> Value<'a> {
-    match left {
-        Value::Number(left_num) => {
-            match right {
-                Value::Number(right_num) => {return f(*left_num,*right_num)}
-                Value::ByteString(_val) => {panic!("unsuported operands for binary operation");}
-                Value::List(_elts) => {panic!("unsuported operands for binary operation");}
-                Value::Quotation(_body) => {panic!("unsuported operands for binary operation");}
-            }
-        }
-        Value::ByteString(_val) => {panic!("unsuported operands for binary operation");}
-        Value::List(_elts) => {panic!("unsuported operands for binary operation");}
-        Value::Quotation(_body) => {panic!("unsuported operands for binary operation");}
+fn unary_number_op0<'a>(val: Value<'a>,f: &dyn Fn(f64)->Value<'a>) -> Value<'a> {
+    match val {
+        Value::Number(num) => f(num),
+        Value::Quotation(_) => {panic!("unsuported operand for unary operation");}
+        _ => return Value::List(as_iter(val).map(|v|unary_number_op0(v,f)).collect())
     }
 }
-            
+fn unary_number_op<'a>(stack: &mut Vec<Value<'a>>,f: fn(f64)->Value<'a>) {
+    let val = stack.pop().unwrap_or_default();
+    stack.push(unary_number_op0(val,&f));
+}
+fn binary_number_op0<'a>(left: Value<'a>,right: Value<'a>,f: fn(f64,f64)->Value<'a>)->Value<'a> {
+    match right {
+        Value::Number(right_num) => {
+            return unary_number_op0(left,&|lhs|f(lhs,right_num));
+        }
+        Value::Quotation(_body) => {panic!("unsuported operands for binary operation");}
+        _ => {}
+    }
+    match left {
+        Value::Number(left_num) => {
+            return unary_number_op0(right,&|rhs|f(left_num,rhs));
+        }
+        Value::Quotation(_body) => {panic!("unsuported operands for binary operation");}
+        _ => {}
+    }
+    let mut left_iter = as_iter(left);
+    let mut right_iter = as_iter(right);
+    let mut res = Vec::with_capacity(std::cmp::max(left_iter.size_hint().0,right_iter.size_hint().0));
+    loop {
+      let lhs = left_iter.next();
+      let rhs = right_iter.next();
+      if lhs.is_none() && rhs.is_none() { break; }
+      res.push(binary_number_op0(lhs.unwrap_or_default(),rhs.unwrap_or_default(),f));
+    }
+    return Value::List(res);
+}
+fn binary_number_op<'a>(stack: &mut Vec<Value<'a>>,f: fn(f64,f64)->Value<'a>) {
+    let right = stack.pop().unwrap_or_default();
+    let left = stack.pop().unwrap_or_default();
+    stack.push(binary_number_op0(left,right,f));
+}
+
 fn eval_call<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a [u8],Value<'a>>) {
     match val {
         Value::Number(_num) => {panic!("cannot call number");} // ? create list with given number of elements
@@ -693,6 +724,15 @@ impl<'a> Iterator for ValueIterator<'a> {
             ValueIterator::ByteString(iter) => iter.next().map(|b|Value::Number(b as f64)),
             ValueIterator::List(iter) => iter.next(),
             ValueIterator::Quotation(iter) => iter.next().map(|x|Value::Quotation(slice::from_ref(x))),
+        }
+    }
+    fn size_hint(&self) -> (usize,Option<usize>) {
+        match self {
+            ValueIterator::Number(range) => range.size_hint(),
+            ValueIterator::NumberRev(range) => range.size_hint(),
+            ValueIterator::ByteString(iter) => iter.size_hint(),
+            ValueIterator::List(iter) => iter.size_hint(),
+            ValueIterator::Quotation(iter) => iter.size_hint(),
         }
     }
 }
@@ -858,20 +898,23 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
                 Value::Quotation(_body) => {panic!("unimplemented")}
             }
         }
+        BuiltIn::NEGATE => {
+            unary_number_op(stack,|num|Value::Number(-num));
+        }
         BuiltIn::ADD => {
-            let right = stack.pop().unwrap_or_default();
-            let left = stack.pop().unwrap_or_default();
-            stack.push(binary_number_op(&left,&right,|left_num,right_num|Value::Number(left_num+right_num)));
+            binary_number_op(stack,|left_num,right_num|Value::Number(left_num+right_num));
+        }
+        BuiltIn::SUBTRACT => {
+            binary_number_op(stack,|left_num,right_num|Value::Number(left_num-right_num));
         }
         BuiltIn::MULTIPLY => {
-            let right = stack.pop().unwrap_or_default();
-            let left = stack.pop().unwrap_or_default();
-            stack.push(binary_number_op(&left,&right,|left_num,right_num|Value::Number(left_num*right_num)));
+            binary_number_op(stack,|left_num,right_num|Value::Number(left_num*right_num));
         }
         BuiltIn::DIVIDE => {
-            let right = stack.pop().unwrap_or_default();
-            let left = stack.pop().unwrap_or_default();
-            stack.push(binary_number_op(&left,&right,|left_num,right_num|Value::Number(left_num/right_num)));
+            binary_number_op(stack,|left_num,right_num|Value::Number(left_num/right_num));
+        }
+        BuiltIn::MODULO => {
+            binary_number_op(stack,|left_num,right_num|Value::Number(left_num%right_num));
         }
         BuiltIn::LEN => {
             let val = stack.pop().unwrap_or_default();
@@ -895,7 +938,7 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
             match size {
                 Value::Number(num) => {
                     op_collect(stack,num.round_ties_even() as i64);
-                } 
+                }
                 Value::ByteString(_val) => {panic!("collect count cannot be a list");}
                 Value::List(_elts) => {panic!("collect count cannot be a list");}
                 Value::Quotation(_body) => {
