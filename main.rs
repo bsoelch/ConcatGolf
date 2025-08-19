@@ -3,15 +3,16 @@ use std::io::{self, Write,stdout};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::ops::Range;
-use std::str::Bytes;
 use std::vec::IntoIter;
+use std::str;
 use std::slice;
 
 // tokenizer
 #[derive(Debug,PartialEq,Clone,Copy)]
 enum TokenType{
     Word,
-    String,
+    CharString,
+    ByteString,
     OpenBracket,
     ClosingBracket,
     EOF
@@ -20,19 +21,20 @@ impl ToString for TokenType {
     fn to_string(&self) -> String {
         match self {
             TokenType::Word => "Word",
-            TokenType::String => "String",
+            TokenType::CharString => "CharString",
+            TokenType::ByteString => "ByteString",
             TokenType::OpenBracket => "OpenBracket",
             TokenType::ClosingBracket => "ClosingBracket",
             TokenType::EOF => "EOF",
         }.to_string()
     }
 }
-const BRACKET_CHARS: &str = "{}";
-fn is_special_char(op_char: char) -> bool {
-    BRACKET_CHARS.contains(op_char)
+const BRACKET_CHARS: &[u8] = b"{}";
+fn is_special_char(op_char: u8) -> bool {
+    BRACKET_CHARS.contains(&op_char)
 }
-fn is_open_bracket_char(op_char: char) -> bool {
-    op_char=='{'
+fn is_open_bracket_char(op_char: u8) -> bool {
+    op_char==b'{'
 }
 #[derive(Debug,Clone,Copy)]
 struct Position{
@@ -42,17 +44,17 @@ struct Position{
 #[derive(Debug,Clone,Copy)]
 struct Token<'a>{
     token_type: TokenType,
-    value: &'a str,
+    value: &'a [u8],
     pos: Position
 }
 
 impl ToString for Token<'_> {
     fn to_string(&self) -> String {
-        format!("{:?}: \"{}\" at {}:{}", self.token_type, self.value, self.pos.line, self.pos.line_pos)
+        format!("{:?}: \"{}\" at {}:{}", self.token_type, String::from_utf8_lossy(self.value), self.pos.line, self.pos.line_pos)
     }
 }
 
-fn tokenize<'a>(input: &'a str) -> Vec<Token<'a>> {
+fn tokenize<'a>(input: &'a [u8]) -> Vec<Token<'a>> {
     // TODO support strings
     let mut start_index: usize=0;
     let mut line = 1;
@@ -60,22 +62,47 @@ fn tokenize<'a>(input: &'a str) -> Vec<Token<'a>> {
     let mut start_line = 1;
     let mut start_pos = 0;
     let mut output = Vec::new();
-    for (i, c) in input.chars().enumerate() {
-        if c == '\n' {
+    let mut string_start = 0;
+    let mut escaped = false;
+    for (i, &c) in input.into_iter().enumerate() {
+        if c == b'\n' {
             line_pos = 0;
             line += 1;
         } else {
             line_pos += 1;
         }
+        if escaped {
+            escaped = false;
+            continue
+        }
+        if string_start != 0 {
+            if c == b'\\' {
+                escaped = true;
+            }
+            if c != string_start {
+                continue
+            }
+        }
         let is_operator = is_special_char(c);
-        if c.is_whitespace() || is_operator {
-            if start_index < i {
+        if c <= 0x20 /*ascii control-character or space*/ || is_operator || c == b'"' || c == b'\'' {
+            if string_start != 0 || start_index < i {
                 let token_value = &input[start_index..i];
                 output.push(Token{
-                    token_type: TokenType::Word,
+                    token_type: if string_start == b'\'' {
+                        TokenType::CharString
+                    } else if string_start == b'"' {
+                        TokenType::ByteString
+                    } else {
+                        TokenType::Word
+                    },
                     value: token_value,
                     pos: Position{line:start_line,line_pos: start_pos}
                 });
+            }
+            if string_start != 0 {
+                string_start = 0;
+            } else if c == b'"' || c == b'\'' {
+                string_start = c;
             }
             if is_operator {
                 output.push(Token{
@@ -92,23 +119,27 @@ fn tokenize<'a>(input: &'a str) -> Vec<Token<'a>> {
     // ensure last token is finished
     let token_value = &input[start_index..];
     if token_value.len() > 0 {
-        let first_char = token_value.chars().next().unwrap();
+        let first_char = token_value[0];
         let token_type = if is_open_bracket_char(first_char) {
             TokenType::OpenBracket
         } else if is_special_char(first_char) {
             TokenType::ClosingBracket
+        } else if string_start == b'\'' {
+            TokenType::CharString
+        } else if string_start == b'"' {
+            TokenType::ByteString
         } else {
             TokenType::Word
         };
         output.push(Token{
             token_type: token_type,
-            value: "",
+            value: token_value,
             pos: Position{line:start_line,line_pos: start_pos}
         });
     }
     output.push(Token{
         token_type: TokenType::EOF,
-        value: token_value,
+        value: b"",
         pos: Position{line:line,line_pos: line_pos}
     });
     return output
@@ -150,68 +181,68 @@ enum BuiltIn {
 
     CALL,
 }
-const BUILTIN_WORDS: [(&str,BuiltIn); 51] = [
+const BUILTIN_WORDS: [(&[u8],BuiltIn); 51] = [
     // stack manipulation
-    ("dup", BuiltIn::DUP),
-    ("dup2", BuiltIn::DUP2),
-    ("over", BuiltIn::OVER),
-    ("over2", BuiltIn::OVER2),
-    ("over3", BuiltIn::OVER2),
-    ("over*", BuiltIn::OVER_N),
-    ("under", BuiltIn::UNDER),
-    ("swap", BuiltIn::SWAP),
-    ("swap2", BuiltIn::SWAP2),
-    ("rot2", BuiltIn::ROT2),
-    ("rot-2", BuiltIn::ROT_2),
-    ("rot3", BuiltIn::ROT3),
-    ("rot-3", BuiltIn::ROT_3),
-    ("rot*", BuiltIn::ROT_N),
-    ("drop", BuiltIn::DROP),
-    ("drop2", BuiltIn::DROP2),
-    ("drop*", BuiltIn::DROP_N),
+    (b"dup", BuiltIn::DUP),
+    (b"dup2", BuiltIn::DUP2),
+    (b"over", BuiltIn::OVER),
+    (b"over2", BuiltIn::OVER2),
+    (b"over3", BuiltIn::OVER2),
+    (b"over*", BuiltIn::OVER_N),
+    (b"under", BuiltIn::UNDER),
+    (b"swap", BuiltIn::SWAP),
+    (b"swap2", BuiltIn::SWAP2),
+    (b"rot2", BuiltIn::ROT2),
+    (b"rot-2", BuiltIn::ROT_2),
+    (b"rot3", BuiltIn::ROT3),
+    (b"rot-3", BuiltIn::ROT_3),
+    (b"rot*", BuiltIn::ROT_N),
+    (b"drop", BuiltIn::DROP),
+    (b"drop2", BuiltIn::DROP2),
+    (b"drop*", BuiltIn::DROP_N),
     // arithmetic operators
-    ("-_", BuiltIn::NEGATE),
-    ("negate", BuiltIn::NEGATE),
-    ("+", BuiltIn::ADD),
-    ("add", BuiltIn::ADD),
-    ("-", BuiltIn::SUBTRACT),
-    ("sub", BuiltIn::SUBTRACT),
-    ("*", BuiltIn::MULTIPLY),
-    ("mul", BuiltIn::MULTIPLY),
-    ("/", BuiltIn::DIVIDE),
-    ("div", BuiltIn::DIVIDE),
-    ("%", BuiltIn::MODULO),
-    ("mod", BuiltIn::MODULO),
-    ("^", BuiltIn::POW),
-    ("pow", BuiltIn::POW),
+    (b"-_", BuiltIn::NEGATE),
+    (b"negate", BuiltIn::NEGATE),
+    (b"+", BuiltIn::ADD),
+    (b"add", BuiltIn::ADD),
+    (b"-", BuiltIn::SUBTRACT),
+    (b"sub", BuiltIn::SUBTRACT),
+    (b"*", BuiltIn::MULTIPLY),
+    (b"mul", BuiltIn::MULTIPLY),
+    (b"/", BuiltIn::DIVIDE),
+    (b"div", BuiltIn::DIVIDE),
+    (b"%", BuiltIn::MODULO),
+    (b"mod", BuiltIn::MODULO),
+    (b"^", BuiltIn::POW),
+    (b"pow", BuiltIn::POW),
     // logic operators
-    ("&", BuiltIn::AND),
-    ("and", BuiltIn::AND),
-    ("|", BuiltIn::OR),
-    ("or", BuiltIn::OR),
-    ("xor", BuiltIn::XOR),
-    ("!", BuiltIn::NOT),
-    ("not", BuiltIn::NOT),
+    (b"&", BuiltIn::AND),
+    (b"and", BuiltIn::AND),
+    (b"|", BuiltIn::OR),
+    (b"or", BuiltIn::OR),
+    (b"xor", BuiltIn::XOR),
+    (b"!", BuiltIn::NOT),
+    (b"not", BuiltIn::NOT),
     // lists
-    ("len", BuiltIn::LEN),
-    ("collect", BuiltIn::COLLECT),
-    ("collect1", BuiltIn::COLLECT1),
-    ("collect2", BuiltIn::COLLECT2),
-    ("...", BuiltIn::SPLAT),
-    ("splat", BuiltIn::SPLAT),
+    (b"len", BuiltIn::LEN),
+    (b"collect", BuiltIn::COLLECT),
+    (b"collect1", BuiltIn::COLLECT1),
+    (b"collect2", BuiltIn::COLLECT2),
+    (b"...", BuiltIn::SPLAT),
+    (b"splat", BuiltIn::SPLAT),
     // control flow
-    ("?", BuiltIn::IF),
-    ("if", BuiltIn::IF),
-    ("repeat", BuiltIn::REPEAT),
-    ("for", BuiltIn::FOR),
-    ("map", BuiltIn::MAP),
+    (b"?", BuiltIn::IF),
+    (b"if", BuiltIn::IF),
+    (b"repeat", BuiltIn::REPEAT),
+    (b"for", BuiltIn::FOR),
+    (b"map", BuiltIn::MAP),
     // functions
-    ("()", BuiltIn::CALL),
-    ("call", BuiltIn::CALL),
+    (b"()", BuiltIn::CALL),
+    (b"call", BuiltIn::CALL),
 ];
-static BUILTIN_INFO: OnceLock<HashMap<&str,BuiltIn>> = OnceLock::new();
-static BUILTIN_NAMES: OnceLock<HashMap<BuiltIn,&str>> = OnceLock::new();
-fn builtin_id(word: &str) -> Option<BuiltIn> {
+static BUILTIN_INFO: OnceLock<HashMap<&[u8],BuiltIn>> = OnceLock::new();
+static BUILTIN_NAMES: OnceLock<HashMap<BuiltIn,&[u8]>> = OnceLock::new();
+fn builtin_id(word: &[u8]) -> Option<BuiltIn> {
     BUILTIN_INFO.get_or_init(|| {
         let mut map = HashMap::new();
         for (key, value) in BUILTIN_WORDS {
@@ -220,7 +251,7 @@ fn builtin_id(word: &str) -> Option<BuiltIn> {
         map
     }).get(word).map(|v|*v)
 }
-fn builtin_name(built_in: &BuiltIn) -> Option<&'static str> {
+fn builtin_name(built_in: &BuiltIn) -> Option<&'static [u8]> {
     BUILTIN_NAMES.get_or_init(|| {
         let mut map = HashMap::new();
         for (name, id) in BUILTIN_WORDS {
@@ -230,26 +261,263 @@ fn builtin_name(built_in: &BuiltIn) -> Option<&'static str> {
     }).get(built_in).map(|v|*v)
 }
 
+struct EscapedByteIter<'a> {
+    byte_iter: slice::Iter<'a,u8>,
+    buffer: [u8; 7],
+    buff_size: u8
+}
+impl<'a> EscapedByteIter<'a> {
+    fn buff_add(&mut self,val: u8) {
+        if self.buff_size >= 7 {
+            panic!("buffer overflow");
+        }
+        self.buffer[self.buff_size as usize] = val;
+        self.buff_size += 1;
+    }
+    fn buff_get(&mut self) -> u8 {
+        if self.buff_size == 0 {
+            panic!("buffer underflow");
+        }
+        let res = self.buffer[0];
+        self.buff_size -= 1;
+        for i in 0..=5 {
+            self.buffer[i] = self.buffer[i+1];
+        }
+        self.buffer[6] = 0;
+        return res;
+    }
+    fn get_hex_char(&mut self) -> u32 {
+        if self.buff_size > 0 {
+            return 0
+        }
+        let next_byte = self.byte_iter.next().copied();
+        if next_byte.is_none() {
+            return 0
+        }
+        let byte_val = next_byte.unwrap();
+        if byte_val >= b'0' && byte_val <= b'9' {
+            return  (byte_val - b'0') as u32;
+        }
+        if byte_val >= b'A' && byte_val <= b'F' {
+            return  (byte_val - b'A') as u32 + 10;
+        }
+        if byte_val >= b'a' && byte_val <= b'f' {
+            return  (byte_val - b'a') as u32 + 10;
+        }
+        self.buff_add(byte_val);
+        return 0
+    }
+    fn encode_utf8(&mut self, codepoint: u32) -> u8 {
+        if codepoint < 0x80 {
+            return codepoint as u8
+        }
+        let next_val = if self.buff_size > 1 {
+            panic!("assertion failed: buffer should contain at most one element");
+        } else if self.buff_size == 1 {
+            Some(self.buff_get())
+        } else {
+            None
+        };
+        if codepoint < 0x800 { // 0x110*** ** 0x10** ****
+            self.buff_add((codepoint&0x3f) as u8 | 0x80);
+            if next_val.is_some() {self.buff_add(next_val.unwrap())}
+            return (codepoint>>6) as u8 | 0xC0
+        } else if codepoint < 0x10000 { // 0x1110**** 0x10 **** ** 0x10** ****
+            self.buff_add(((codepoint>>6)&0x3f) as u8 | 0x80);
+            self.buff_add((codepoint&0x3f) as u8 | 0x80);
+            if next_val.is_some() {self.buff_add(next_val.unwrap())}
+            return (codepoint>>12) as u8 | 0xE0
+        } else if codepoint < 0x200000 { // 0x11110* ** 0x10 ** **** 0x10**** ** 0x10** ****
+            self.buff_add(((codepoint>>12)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>6)&0x3f) as u8 | 0x80);
+            self.buff_add((codepoint&0x3f) as u8 | 0x80);
+            if next_val.is_some() {self.buff_add(next_val.unwrap())}
+            return (codepoint>>18) as u8 | 0xF0
+        } else if codepoint < 0x4000000 { // 0x111110** 0x10**** ** 0x10 ** **** 0x10**** ** 0x10** ****
+            self.buff_add(((codepoint>>18)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>12)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>6)&0x3f) as u8 | 0x80);
+            self.buff_add((codepoint&0x3f) as u8 | 0x80);
+            if next_val.is_some() {self.buff_add(next_val.unwrap())}
+            return (codepoint>>24) as u8 | 0xF8
+        // 0x1111110* 0x10** **** 0x10**** ** 0x10 ** **** 0x10**** ** 0x10** ****
+        } else if codepoint < 0x80000000 {
+            self.buff_add(((codepoint>>24)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>18)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>12)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>6)&0x3f) as u8 | 0x80);
+            self.buff_add((codepoint&0x3f) as u8 | 0x80);
+            if next_val.is_some() {self.buff_add(next_val.unwrap())}
+            return (codepoint>>30) as u8 | 0xFC
+        } else {
+            self.buff_add(((codepoint>>30)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>24)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>18)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>12)&0x3f) as u8 | 0x80);
+            self.buff_add(((codepoint>>6)&0x3f) as u8 | 0x80);
+            self.buff_add((codepoint&0x3f) as u8 | 0x80);
+            if next_val.is_some() {self.buff_add(next_val.unwrap())}
+            return 0xFE
+        }
+    }
+}
+fn escaped_byte_iter<'a>(val: &'a [u8]) -> EscapedByteIter<'a> {
+    EscapedByteIter{byte_iter: val.into_iter(),buffer:[0,0,0,0,0,0,0],buff_size:0}
+}
+impl<'a> Iterator for EscapedByteIter<'a> {
+    type Item = u8;
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = if self.buff_size > 0 {
+            Some(self.buff_get())
+        } else {
+            self.byte_iter.next().copied()
+        };
+        if next.is_none() || next.unwrap() != b'\\' { // escape-esquence -> go to next byte
+            return next;
+        }
+        let escaped = self.byte_iter.next().copied();
+        if escaped.is_none() {
+            return None
+        }
+        match escaped.unwrap() {
+            b'n' => return Some(b'\n'),
+            b't' => return Some(b'\t'),
+            b'r' => return Some(b'\r'),
+            b'x' => {
+                let byte_val = (16 * self.get_hex_char()) + self.get_hex_char();
+                return Some(byte_val as u8);
+            },
+            b'u' => {
+                let mut codepoint = 0;
+                for _ in 0..4 {
+                    codepoint = 16* codepoint + self.get_hex_char();
+                }
+                return Some(self.encode_utf8(codepoint));
+            },
+            b'U' => {
+                let mut codepoint = 0;
+                for _ in 0..8 {
+                    codepoint = 16* codepoint + self.get_hex_char();
+                }
+                return Some(self.encode_utf8(codepoint));
+            },
+            // TODO? unicode escape sequences
+            _ => return escaped
+        }
+    }
+}
+struct EscapedCharIter<'a> {
+    byte_iter: EscapedByteIter<'a>
+}
+// decoder for a string with escape sequences using an extension of utf8
+// * treat bytes between 0x80 and 0xBF as codepoints when they appear outside multi-byte sequences
+// * pad mult-byte sequences to correct length (by appending 0x80)
+// * allow codepoints up to 0x3ffffffffff
+fn escaped_char_iter<'a>(val: &'a [u8]) -> EscapedCharIter<'a> {
+    EscapedCharIter{byte_iter: escaped_byte_iter(val)}
+}
+impl<'a> EscapedCharIter<'a>{
+    fn update_value(&mut self,mut value: u64) -> u64 {
+        value = value << 6;
+        if self.byte_iter.buff_size > 0 {
+            return value;
+        }
+        let next = self.byte_iter.next();
+        if next.is_none() || next.unwrap() < 0x80 || next.unwrap() >= 0xC0 {
+            self.byte_iter.buff_add(next.unwrap());
+            return value;
+        }
+        return value | (next.unwrap() & 0x3f) as u64;
+    }
+}
+impl<'a> Iterator for EscapedCharIter<'a> {
+    type Item = u64;
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = self.byte_iter.next();
+        if next.is_none() {
+            return None;
+        }
+        let mut value = next.unwrap() as u64;
+        if value < 0xC0 { // not the start of an utf8 sequence
+            return Some(value)
+        } else if value < 0xE0 { // 110* ****
+            value = value & 0x1F;
+            value = self.update_value(value);
+            return Some(value)
+        } else if value < 0xF0 { // 1110 ****
+            value = value & 0x0F;
+            value = self.update_value(value);
+            value = self.update_value(value);
+            return Some(value)
+        } else if value < 0xF8 { // 1111 0***
+            value = value & 0x07;
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            return Some(value)
+        } else if value < 0xFC { // 1111 10**
+            value = value & 0x03;
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            return Some(value)
+        } else if value < 0xFE { // 1111 110*
+            value = value & 0x01;
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            return Some(value)
+        } else if value == 0xFE { // 1111 1110
+            value = 0;
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            return Some(value)
+        } else { // 1111 1111
+            value = 0;
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            value = self.update_value(value);
+            return Some(value)
+        }
+    }
+}
+
+
 #[derive(Debug,Clone)]
 enum Atom<'a> {
     BuiltInWord(BuiltIn),
     Number(f64), // TODO? use arbitary pression library for numbers (? rug crate )
-    Assign(&'a str),
-    Get(&'a str),
-    String(&'a str),
+    Assign(&'a [u8]),
+    Get(&'a [u8]),
+    ByteString(&'a [u8]),
+    CharString(&'a [u8]),
     Quotation(Vec<Atom<'a>>),
 }
 fn dump_atoms<'a>(out_file: &mut fs::File, atoms: &'a [Atom<'a>],indent: usize)-> io::Result<()> {
     for atom in atoms {
         match atom {
             Atom::BuiltInWord(built_in) => {
-                writeln!(out_file,"{}BuiltIn({})","   ".repeat(indent),builtin_name(built_in).unwrap())?;
+                writeln!(out_file,"{}BuiltIn({})","   ".repeat(indent),String::from_utf8_lossy(builtin_name(built_in).unwrap()))?;
             }
             Atom::Number(value) => {
                 writeln!(out_file,"{}Number({})","   ".repeat(indent),value)?;
             }
-            Atom::String(value) => { // TODO? escaping
-                writeln!(out_file,"{}String({})","   ".repeat(indent),value.to_string())?;
+            Atom::ByteString(value) => { // TODO! escape special characters in string values
+                writeln!(out_file,"{}ByteString({})","   ".repeat(indent),String::from_utf8_lossy(value))?;
+            }
+            Atom::CharString(value) => {
+                writeln!(out_file,"{}CharString({})","   ".repeat(indent),String::from_utf8_lossy(value))?;
             }
             Atom::Quotation(elts) => {
                 writeln!(out_file,"{}{{","   ".repeat(indent))?;
@@ -257,10 +525,10 @@ fn dump_atoms<'a>(out_file: &mut fs::File, atoms: &'a [Atom<'a>],indent: usize)-
                 writeln!(out_file,"{}}}","   ".repeat(indent))?;
             }
             Atom::Assign(name) => {
-                writeln!(out_file,"{}Assign({})","   ".repeat(indent),name.to_string())?;
+                writeln!(out_file,"{}Assign({})","   ".repeat(indent),String::from_utf8_lossy(name))?;
             }
             Atom::Get(name) => {
-                writeln!(out_file,"{}Get({})","   ".repeat(indent),name.to_string())?;
+                writeln!(out_file,"{}Get({})","   ".repeat(indent),String::from_utf8_lossy(name))?;
             }
         }
     }
@@ -271,23 +539,24 @@ fn try_parse_atom<'a>(mut tokens: &'a [Token<'a>]) -> Result<(Atom<'a>,usize),&'
     match tokens[0].token_type {
         TokenType::Word => {
             let word = tokens[0].value;
-            if word.len() > 0 && word.chars().next().unwrap().is_digit(10) ||
-                word.len() > 1 && word.chars().next().unwrap() == '-' &&
-                    word[1..].chars().next().unwrap().is_digit(10) {
+            if word.len() > 0 && word[0].is_ascii_digit() ||
+                word.len() > 1 && word[0] == b'-' && word[1].is_ascii_digit() {
                 // TODO support non-integer numbers
-                if let Ok(value) = word.parse::<f64>() {
-                    return Ok((Atom::Number(value),1))
-                } else {
-                    return Err(&tokens[0])
+                if let Ok(str_val) = str::from_utf8(word) {
+                    if let Ok(value) = str_val.parse::<f64>() {
+                        return Ok((Atom::Number(value),1))
+                    }
                 }
-            } else if word.len() > 0 && word.ends_with("=") {
+                return Err(&tokens[0])
+            } else if word.len() > 0 && word.ends_with(b"=") {
                 return Ok((Atom::Assign(&word[..(word.len()-1)]),1))
             } else if let Some(built_in) = builtin_id(word) {
                 return Ok((Atom::BuiltInWord(built_in),1))
             }
             return Ok((Atom::Get(word),1))
         },
-        TokenType::String => return Ok((Atom::String(tokens[0].value),1)),
+        TokenType::CharString => return Ok((Atom::CharString(tokens[0].value),1)),
+        TokenType::ByteString => return Ok((Atom::ByteString(tokens[0].value),1)),
         TokenType::OpenBracket => {
             let mut consumed = 1;
             tokens=&tokens[1..];
@@ -331,7 +600,7 @@ fn parse_program<'a>(mut tokens: &'a [Token<'a>]) -> Vec<Atom<'a>> {
 #[derive(Debug,Clone)]
 enum Value<'a>{
     Number(f64),
-    String(&'a str),
+    ByteString(&'a [u8]),
     List(Vec<Value<'a>>),
     Quotation(&'a[Atom<'a>]),
 }
@@ -346,8 +615,8 @@ impl ToString for Value<'_> {
             Value::Number(num) => {
                 return format!("Number({})",num);
             }
-            Value::String(val) => {
-                return format!("String({})",val);
+            Value::ByteString(val) => {
+                return format!("ByteString({})", String::from_utf8_lossy(val));
             }
             Value::List(elts) => {
                 let mut res = String::from("List: [");
@@ -372,28 +641,28 @@ fn binary_number_op<'a>(left: &Value<'a>,right: &Value<'a>,f: fn(f64,f64)->Value
         Value::Number(left_num) => {
             match right {
                 Value::Number(right_num) => {return f(*left_num,*right_num)}
-                Value::String(_val) => {panic!("unsuported operands for binary operation");}
+                Value::ByteString(_val) => {panic!("unsuported operands for binary operation");}
                 Value::List(_elts) => {panic!("unsuported operands for binary operation");}
                 Value::Quotation(_body) => {panic!("unsuported operands for binary operation");}
             }
         }
-        Value::String(_val) => {panic!("unsuported operands for binary operation");}
+        Value::ByteString(_val) => {panic!("unsuported operands for binary operation");}
         Value::List(_elts) => {panic!("unsuported operands for binary operation");}
         Value::Quotation(_body) => {panic!("unsuported operands for binary operation");}
     }
 }
             
-fn eval_call<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a str,Value<'a>>) {
+fn eval_call<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a [u8],Value<'a>>) {
     match val {
         Value::Number(_num) => {panic!("cannot call number");} // ? create list with given number of elements
-        Value::String(_val) => {panic!("cannot call string");} // TODO? eval string as code
+        Value::ByteString(_val) => {panic!("cannot call string");} // TODO? eval string as code
         Value::List(_elts) => {panic!("cannot call list");} // TODO? call for each element (with current stack)
         Value::Quotation(body) => {
             eval_block(body,stack,globals)
         }
     }
 }
-fn eval_or_value<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a str,Value<'a>>) {
+fn eval_or_value<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a [u8],Value<'a>>) {
     match val {
         Value::Quotation(body) => {
             eval_block(body,stack,globals)
@@ -404,7 +673,7 @@ fn eval_or_value<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut Ha
 fn as_bool(val: Value) -> bool {
     return match val {
         Value::Number(num) => num != 0.0,
-        Value::String(val) => val.len() != 0,
+        Value::ByteString(val) => val.len() != 0,
         Value::List(elts) => elts.len() != 0,
         Value::Quotation(body) => body.len() != 0
     }
@@ -412,7 +681,7 @@ fn as_bool(val: Value) -> bool {
 
 enum ValueIterator<'a> {
     Number(Range<i64>),
-    String(Bytes<'a>),
+    ByteString(EscapedByteIter<'a>),
     List(IntoIter<Value<'a>>),
     Quotation(slice::Iter<'a, Atom<'a>>),
 }
@@ -422,7 +691,7 @@ impl<'a> Iterator for ValueIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             ValueIterator::Number(range) => range.next().map(|i| Value::Number(i as f64)),
-            ValueIterator::String(iter) => iter.next().map(|b|Value::Number(b as f64)),
+            ValueIterator::ByteString(iter) => iter.next().map(|b|Value::Number(b as f64)),
             ValueIterator::List(iter) => iter.next(),
             ValueIterator::Quotation(iter) => iter.next().map(|x|Value::Quotation(slice::from_ref(x))),
         }
@@ -432,7 +701,7 @@ fn as_iter(val : Value) -> ValueIterator {
     match val {
         // TODO how to handle negatives
         Value::Number(num) => return ValueIterator::Number(0..(num as i64)), //TODO? rounding
-        Value::String(msg) => return ValueIterator::String(msg.bytes()),
+        Value::ByteString(msg) => return ValueIterator::ByteString(escaped_byte_iter(msg)),
         Value::List(elts) => return ValueIterator::List(elts.into_iter()),
         Value::Quotation(body) => return ValueIterator::Quotation(body.into_iter()),
     };
@@ -510,7 +779,7 @@ fn op_collect<'a>(stack: &mut Vec<Value<'a>>,count: i64) {
     stack.push(Value::List(elts));
 }
 
-fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a str,Value<'a>>) {
+fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a [u8],Value<'a>>) {
     match built_in {
         BuiltIn::DUP => {
             stack_copy(stack,0);
@@ -533,7 +802,7 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
                 Value::Number(num) => {
                     stack_copy(stack,num.round() as i64);
                 }
-                Value::String(_val) => {panic!("unimplemented")}
+                Value::ByteString(_val) => {panic!("unimplemented")}
                 Value::List(_elts) => {panic!("unimplemented")}
                 Value::Quotation(_body) => {panic!("unimplemented")}
             }
@@ -563,7 +832,7 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
                 Value::Number(num) => {
                     stack_rot(stack,num.round() as i64);
                 }
-                Value::String(_val) => {panic!("unimplemented")}
+                Value::ByteString(_val) => {panic!("unimplemented")}
                 Value::List(_elts) => {panic!("unimplemented")}
                 Value::Quotation(_body) => {panic!("unimplemented")}
             }
@@ -580,7 +849,7 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
                 Value::Number(num) => {
                     stack_drop_or_dup(stack,num.round() as i64);
                 }
-                Value::String(_val) => {panic!("unimplemented")}
+                Value::ByteString(_val) => {panic!("unimplemented")}
                 Value::List(_elts) => {panic!("unimplemented")}
                 Value::Quotation(_body) => {panic!("unimplemented")}
             }
@@ -605,7 +874,7 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
             let length = match val {
                 // TODO is this a useful value
                 Value::Number(num) => (num.abs()+1.0).log2().ceil()+(if num<0. {1.} else {0.}),
-                Value::String(val) => val.len() as f64,
+                Value::ByteString(val) => val.len() as f64,
                 Value::List(elts) => elts.len() as f64,
                 Value::Quotation(body) => body.len() as f64
             };
@@ -624,7 +893,7 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
                     let count = num as i64;//TODO? rounding
                     op_collect(stack,count);
                 } 
-                Value::String(_val) => {panic!("collect count cannot be a list");}
+                Value::ByteString(_val) => {panic!("collect count cannot be a list");}
                 Value::List(_elts) => {panic!("collect count cannot be a list");}
                 Value::Quotation(_body) => {
                     panic!("collect count cannot be a quotation");
@@ -665,17 +934,20 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
             let val = stack.pop().unwrap_or_default();
             eval_call(&val,stack,globals);
         }
-        _ => panic!("unimplemented: {}",builtin_name(&built_in).unwrap())
+        _ => panic!("unimplemented: {}",String::from_utf8_lossy(builtin_name(&built_in).unwrap()))
     }
 }
-fn eval_block<'a>(atoms: &'a [Atom<'a>],stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a str,Value<'a>>){
+fn eval_block<'a>(atoms: &'a [Atom<'a>],stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a [u8],Value<'a>>){
     for atom in atoms {
         match atom {
             Atom::Number(num) => {
                 stack.push(Value::Number(*num))
             }
-            Atom::String(val) => {
-                stack.push(Value::String(val))
+            Atom::CharString(val) => {
+                escaped_char_iter(val).for_each(|c|stack.push(Value::Number(c as i32 as f64)))
+            }
+            Atom::ByteString(val) => {
+                stack.push(Value::ByteString(val))
             }
             Atom::Quotation(body) => {
                 stack.push(Value::Quotation(body))
@@ -711,7 +983,7 @@ fn run_program<'a>(atoms: &'a [Atom<'a>]) -> Vec<Value<'a>> {
 // main
 fn main() -> io::Result<()> {
     // Read the content of the input file
-    let input = fs::read_to_string("in.txt")?;
+    let input = fs::read("in.txt")?;
 
     let tokens = tokenize(&input);
     let atoms = parse_program(&tokens);
