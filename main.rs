@@ -50,7 +50,13 @@ struct Token<'a>{
 
 impl ToString for Token<'_> {
     fn to_string(&self) -> String {
-        format!("{:?}: \"{}\" at {}:{}", self.token_type, String::from_utf8_lossy(self.value), self.pos.line, self.pos.line_pos)
+        if self.token_type == TokenType::CharString || self.token_type == TokenType::ByteString {
+            let mut value = String::new();
+            append_escaped_string(&mut value,self.value);
+            format!("{:?}: \"{}\" at {}:{}", self.token_type,value , self.pos.line, self.pos.line_pos)
+        } else {
+            format!("{:?}: \"{}\" at {}:{}", self.token_type,String::from_utf8_lossy(self.value) , self.pos.line, self.pos.line_pos)
+        }
     }
 }
 
@@ -496,6 +502,25 @@ impl<'a> Iterator for EscapedCharIter<'a> {
     }
 }
 
+fn append_escaped_string(buf: &mut String,val: &[u8]) {
+    buf.reserve(val.len());
+    for &chr in val.into_iter() {
+        if chr < 0x20 || chr >= 0x7f {
+            match chr {
+                b'\n' => {buf.push_str("\\n");}
+                b'\r' => {buf.push_str("\\r");}
+                b'\t' => {buf.push_str("\\t");}
+                _ => {
+                    buf.push_str("\\x");
+                    buf.push(b"0123456789ABCDEF"[((chr>>4)&0xf) as usize] as char);
+                    buf.push(b"0123456789ABCDEF"[(chr & 0xf) as usize] as char);
+                }
+            }
+            continue
+        }
+        buf.push(chr as char);
+    }
+}
 
 #[derive(Debug,Clone)]
 enum Atom<'a> {
@@ -516,11 +541,17 @@ fn dump_atoms<'a>(out_file: &mut fs::File, atoms: &'a [Atom<'a>],indent: usize)-
             Atom::Number(value) => {
                 writeln!(out_file,"{}Number({})","   ".repeat(indent),value)?;
             }
-            Atom::ByteString(value) => { // TODO! escape special characters in string values
-                writeln!(out_file,"{}ByteString({})","   ".repeat(indent),String::from_utf8_lossy(value))?;
+            Atom::ByteString(value) => {
+                let mut res = "   ".repeat(indent);
+                res+="ByteString(";
+                append_escaped_string(&mut res,value);
+                writeln!(out_file,"{})",res)?;
             }
             Atom::CharString(value) => {
-                writeln!(out_file,"{}CharString({})","   ".repeat(indent),String::from_utf8_lossy(value))?;
+                let mut res = "   ".repeat(indent);
+                res+="CharString(";
+                append_escaped_string(&mut res,value);
+                writeln!(out_file,"{})",res)?;
             }
             Atom::Quotation(elts) => {
                 writeln!(out_file,"{}{{","   ".repeat(indent))?;
@@ -618,7 +649,9 @@ impl ToString for Value<'_> {
                 return format!("Number({})",num);
             }
             Value::ByteString(val) => {
-                return format!("ByteString({})", String::from_utf8_lossy(val));
+                let mut buf = String::new();
+                append_escaped_string(&mut buf,val);
+                return format!("ByteString({})", buf);
             }
             Value::List(elts) => {
                 let mut res = String::from("List: [");
