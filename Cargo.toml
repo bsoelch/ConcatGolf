@@ -1,0 +1,11 @@
+[package]
+name = "ConcatGolf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies.gmp-mpfr-sys]
+version = "1.6"
+features = ["use-system-libs"]
+
+[dependencies]
+rug = "1.27"

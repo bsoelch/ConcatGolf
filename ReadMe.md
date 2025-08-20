@@ -5,16 +5,7 @@ A concatenative golfing language
 
 ## Usage
 
-Build:
-
-```
-rustc main.rs -o main
-```
-
-Run:
-
-1. create a file `in.txt` containing your source code
-2. execute `./main`
+store the source code in `./in.txt` use the command `cargo run` to build and run the project
 
 ## TODOs
 
