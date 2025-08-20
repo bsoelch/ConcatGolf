@@ -2,10 +2,12 @@ use std::fs;
 use std::io::{self, Write,stdout};
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::ops::Range;
 use std::vec::IntoIter;
 use std::str;
 use std::slice;
+use rug::Integer;
+use rug::Assign;
+use rug::ops::Pow;
 
 // tokenizer
 #[derive(Debug,PartialEq,Clone,Copy)]
@@ -165,6 +167,7 @@ enum BuiltIn {
     SUBTRACT,
     MULTIPLY,
     DIVIDE,
+    FLOOR_DIVIDE,
     MODULO,
     POW,
 
@@ -191,7 +194,7 @@ enum BuiltIn {
     PRINT_ALL,
     PRINTLN_ALL,
 }
-const BUILTIN_WORDS: [(&[u8],BuiltIn); 55] = [
+const BUILTIN_WORDS: [(&[u8],BuiltIn); 57] = [
     // stack manipulation
     (b"dup", BuiltIn::DUP),
     (b"dup2", BuiltIn::DUP2),
@@ -221,6 +224,8 @@ const BUILTIN_WORDS: [(&[u8],BuiltIn); 55] = [
     (b"mul", BuiltIn::MULTIPLY),
     (b"/", BuiltIn::DIVIDE),
     (b"div", BuiltIn::DIVIDE),
+    (b"//", BuiltIn::FLOOR_DIVIDE),
+    (b"idiv", BuiltIn::FLOOR_DIVIDE),
     (b"%", BuiltIn::MODULO),
     (b"mod", BuiltIn::MODULO),
     (b"^", BuiltIn::POW),
@@ -436,7 +441,8 @@ fn append_escaped_string(buf: &mut String,val: &[u8]) {
 #[derive(Debug,Clone)]
 enum Atom<'a> {
     BuiltInWord(BuiltIn),
-    Number(f64), // TODO? use arbitary pression library for numbers (? rug crate )
+    Integer(Integer),
+    // TODO add support for floats
     Assign(&'a [u8]),
     Get(&'a [u8]),
     String(&'a [u8]),
@@ -449,8 +455,8 @@ fn dump_atoms<'a>(out_file: &mut fs::File, atoms: &'a [Atom<'a>],indent: usize)-
             Atom::BuiltInWord(built_in) => {
                 writeln!(out_file,"{}BuiltIn({})","   ".repeat(indent),String::from_utf8_lossy(builtin_name(built_in).unwrap()))?;
             }
-            Atom::Number(value) => {
-                writeln!(out_file,"{}Number({})","   ".repeat(indent),value)?;
+            Atom::Integer(value) => {
+                writeln!(out_file,"{}Integer({})","   ".repeat(indent),value)?;
             }
             Atom::String(value) => {
                 let mut res = "   ".repeat(indent);
@@ -487,8 +493,9 @@ fn try_parse_atom<'a>(mut tokens: &'a [Token<'a>]) -> Result<(Atom<'a>,usize),&'
             if word.len() > 0 && word[0].is_ascii_digit() ||
                 word.len() > 1 && word[0] == b'-' && word[1].is_ascii_digit() {
                 if let Ok(str_val) = str::from_utf8(word) {
-                    if let Ok(value) = str_val.parse::<f64>() {
-                        return Ok((Atom::Number(value),1))
+                    // TODO? add wrapper to detect base-prefixes 0b, 0x, ? <#>b
+                    if let Ok(value) = Integer::parse(str_val) {
+                        return Ok((Atom::Integer(Integer::from(value)),1))
                     }
                 }
                 return Err(&tokens[0])
@@ -543,20 +550,20 @@ fn parse_program<'a>(mut tokens: &'a [Token<'a>]) -> Vec<Atom<'a>> {
 // interperter
 #[derive(Debug,Clone)]
 enum Value<'a>{
-    Number(f64),
+    Integer(Integer),
     List(Vec<Value<'a>>),
     Quotation(&'a[Atom<'a>]),
 }
 impl Default for Value<'_> {
     fn default() -> Self {
-        Value::Number(0f64)
+        Value::Integer(Integer::ZERO)
     }
 }
 impl ToString for Value<'_> {
     fn to_string(&self) -> String {
         match self {
-            Value::Number(num) => {
-                return format!("Number({})",num);
+            Value::Integer(num) => {
+                return format!("Integer({})",num);
             }
             Value::List(elts) => {
                 let mut res = String::from("List: [");
@@ -577,9 +584,13 @@ impl ToString for Value<'_> {
 }
 fn value_string<'a>(buf: &mut String,val: Value<'a>) {
     match val {
-        Value::Number(num) => {
-            let char_id = num.round();
-            buf.push(char::from_u32(char_id as u32).unwrap_or('\u{FFFD}'));
+        Value::Integer(num) => {
+            if num < 0 || num >= 0x80000000_u32 {
+                buf.push('\u{FFFD}')
+            } else {
+                let char_id = num.to_u32().unwrap();
+                buf.push(char::from_u32(char_id as u32).unwrap_or('\u{FFFD}'));
+            }
         }
         // TODO? print (part of) body
         Value::Quotation(_code) => {
@@ -594,7 +605,7 @@ fn value_string<'a>(buf: &mut String,val: Value<'a>) {
 }
 fn elements_string<'a>(buf: &mut String,val: Value<'a>) {
     match val {
-        Value::Number(num) => {
+        Value::Integer(num) => {
             buf.push_str(&format!("{}",num));
         }
         // TODO? print (part of) body
@@ -614,28 +625,28 @@ fn elements_string<'a>(buf: &mut String,val: Value<'a>) {
     }
 }
 
-fn unary_number_op0<'a>(val: Value<'a>,f: &dyn Fn(f64)->Value<'a>) -> Value<'a> {
+fn unary_number_op0<'a>(val: Value<'a>,f_int: &dyn Fn(Integer)->Value<'a>) -> Value<'a> {
     match val {
-        Value::Number(num) => f(num),
+        Value::Integer(num) => f_int(num),
         Value::Quotation(_) => {panic!("unsuported operand for unary operation");}
-        _ => return Value::List(as_iter(val).map(|v|unary_number_op0(v,f)).collect())
+        _ => return Value::List(as_iter(val).map(|v|unary_number_op0(v,f_int)).collect())
     }
 }
-fn unary_number_op<'a>(stack: &mut Vec<Value<'a>>,f: fn(f64)->Value<'a>) {
+fn unary_number_op<'a>(stack: &mut Vec<Value<'a>>,f: fn(Integer)->Value<'a>) {
     let val = stack.pop().unwrap_or_default();
     stack.push(unary_number_op0(val,&f));
 }
-fn binary_number_op0<'a>(left: Value<'a>,right: Value<'a>,f: fn(f64,f64)->Value<'a>)->Value<'a> {
+fn binary_number_op0<'a>(left: Value<'a>,right: Value<'a>,f_int_l: fn(Integer,&Integer)->Value<'a>,f_int_r: fn(&Integer,Integer)->Value<'a>)->Value<'a> {
     match right {
-        Value::Number(right_num) => {
-            return unary_number_op0(left,&|lhs|f(lhs,right_num));
+        Value::Integer(right_num) => {
+            return unary_number_op0(left,&|lhs|f_int_l(lhs,&right_num));
         }
         Value::Quotation(_body) => {panic!("unsuported operands for binary operation");}
         _ => {}
     }
     match left {
-        Value::Number(left_num) => {
-            return unary_number_op0(right,&|rhs|f(left_num,rhs));
+        Value::Integer(left_num) => {
+            return unary_number_op0(right,&|rhs|f_int_r(&left_num,rhs));
         }
         Value::Quotation(_body) => {panic!("unsuported operands for binary operation");}
         _ => {}
@@ -647,19 +658,19 @@ fn binary_number_op0<'a>(left: Value<'a>,right: Value<'a>,f: fn(f64,f64)->Value<
       let lhs = left_iter.next();
       let rhs = right_iter.next();
       if lhs.is_none() && rhs.is_none() { break; }
-      res.push(binary_number_op0(lhs.unwrap_or_default(),rhs.unwrap_or_default(),f));
+      res.push(binary_number_op0(lhs.unwrap_or_default(),rhs.unwrap_or_default(),f_int_l,f_int_r));
     }
     return Value::List(res);
 }
-fn binary_number_op<'a>(stack: &mut Vec<Value<'a>>,f: fn(f64,f64)->Value<'a>) {
+fn binary_number_op<'a>(stack: &mut Vec<Value<'a>>,f_int_l: fn(Integer,&Integer)->Value<'a>,f_int_r: fn(&Integer,Integer)->Value<'a>) {
     let right = stack.pop().unwrap_or_default();
     let left = stack.pop().unwrap_or_default();
-    stack.push(binary_number_op0(left,right,f));
+    stack.push(binary_number_op0(left,right,f_int_l,f_int_r));
 }
 
 fn eval_call<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a [u8],Value<'a>>) {
     match val {
-        Value::Number(_num) => {panic!("cannot call number");} // ? create list with given number of elements
+        Value::Integer(_num) => {panic!("cannot call number");} // ? create list with given number of elements
         Value::List(_elts) => {panic!("cannot call list");} // TODO? call for each element (with current stack)
         Value::Quotation(body) => {
             eval_block(body,stack,globals)
@@ -676,15 +687,51 @@ fn eval_or_value<'a>(val: &Value<'a>,stack: &mut Vec<Value<'a>>,globals: &mut Ha
 }
 fn as_bool(val: Value) -> bool {
     return match val {
-        Value::Number(num) => num != 0.0,
+        Value::Integer(num) => num != 0,
         Value::List(elts) => elts.len() != 0,
         Value::Quotation(body) => body.len() != 0
     }
 }
 
+struct IntRange{
+    counter: Integer, // previous iteration counter
+    limit: Integer, // iteration limit (inclusive for reveresed iter, exclusive otherwise)
+    reversed: bool // if true counter is decremented, otherwise incremeneted
+}
+impl Iterator for IntRange {
+  type Item = Integer;
+  fn next(&mut self) -> Option<Self::Item> {
+     if self.reversed {
+        if self.counter <= self.limit {
+            return None 
+        }
+        self.counter -= 1;
+        return Some(self.counter.clone());
+     } else {
+        if self.counter >= self.limit {
+            return None
+        }
+        let res = self.counter.clone();
+        self.counter += 1;
+        return Some(res);
+     }
+  }
+  fn size_hint(&self) -> (usize,Option<usize>) {
+    if let Some(counter) = self.counter.to_i64() && 
+            let Some(limit) = self.limit.to_i64() {
+        let remaining = if self.reversed {
+            counter - limit
+        } else {
+            limit - counter
+        };
+        assert!(remaining >= 0,"remaining >= 0");
+        return (remaining as usize,Some(remaining  as usize));
+    }
+    return (0,None); // values do not fit into i64
+  }
+}
 enum ValueIterator<'a> {
-    Number(Range<i64>),
-    NumberRev(std::iter::Rev<Range<i64>>),
+    Integer(IntRange),
     List(IntoIter<Value<'a>>),
     Quotation(slice::Iter<'a, Atom<'a>>),
 }
@@ -693,16 +740,14 @@ impl<'a> Iterator for ValueIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            ValueIterator::Number(range) => range.next().map(|i| Value::Number(i as f64)),
-            ValueIterator::NumberRev(range) => range.next().map(|i| Value::Number(i as f64)),
+            ValueIterator::Integer(range) => range.next().map(|i| Value::Integer(i.clone())),
             ValueIterator::List(iter) => iter.next(),
             ValueIterator::Quotation(iter) => iter.next().map(|x|Value::Quotation(slice::from_ref(x))),
         }
     }
     fn size_hint(&self) -> (usize,Option<usize>) {
         match self {
-            ValueIterator::Number(range) => range.size_hint(),
-            ValueIterator::NumberRev(range) => range.size_hint(),
+            ValueIterator::Integer(range) => range.size_hint(),
             ValueIterator::List(iter) => iter.size_hint(),
             ValueIterator::Quotation(iter) => iter.size_hint(),
         }
@@ -710,11 +755,11 @@ impl<'a> Iterator for ValueIterator<'a> {
 }
 fn as_iter(val : Value) -> ValueIterator {
     match val {
-        Value::Number(num) => {
+        Value::Integer(num) => {
             if num >= 0.0 {
-                return ValueIterator::Number(0..(num.ceil() as i64))
+                return ValueIterator::Integer(IntRange{limit: num-1,counter: Integer::from(-1),reversed: false})
             } else {
-                return ValueIterator::NumberRev((1..(1-num.ceil() as i64)).rev())
+                return ValueIterator::Integer(IntRange{limit: Integer::from(1),counter: 1-num, reversed: true});
             }
         },
         Value::List(elts) => return ValueIterator::List(elts.into_iter()),
@@ -814,8 +859,9 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
         BuiltIn::OVER_N => {
             let count = stack.pop().unwrap_or_default();
             match count {
-                Value::Number(num) => {
-                    stack_copy(stack,num.round() as i64);
+                Value::Integer(num) => {
+                    // panic if stack count does not fit in i64
+                    stack_copy(stack,num.to_i64().unwrap());
                 }
                 Value::List(_elts) => {panic!("unimplemented")}
                 Value::Quotation(_body) => {panic!("unimplemented")}
@@ -843,8 +889,9 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
         BuiltIn::ROT_N => {
             let count = stack.pop().unwrap_or_default();
             match count {
-                Value::Number(num) => {
-                    stack_rot(stack,num.round() as i64);
+                Value::Integer(num) => {
+                    // panic if stack count does not fit in i64
+                    stack_rot(stack,num.to_i64().unwrap());
                 }
                 Value::List(_elts) => {panic!("unimplemented")}
                 Value::Quotation(_body) => {panic!("unimplemented")}
@@ -859,40 +906,47 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
         BuiltIn::DROP_N => {
             let count = stack.pop().unwrap_or_default();
             match count {
-                Value::Number(num) => {
-                    stack_drop_or_dup(stack,num.round() as i64);
+                Value::Integer(num) => {
+                    // panic if stack count does not fit in i64
+                    stack_drop_or_dup(stack,num.to_i64().unwrap());
                 }
                 Value::List(_elts) => {panic!("unimplemented")}
                 Value::Quotation(_body) => {panic!("unimplemented")}
             }
         }
         BuiltIn::NEGATE => {
-            unary_number_op(stack,|num|Value::Number(-num));
+            unary_number_op(stack,|num|Value::Integer(-num));
         }
         BuiltIn::ADD => {
-            binary_number_op(stack,|left_num,right_num|Value::Number(left_num+right_num));
+            binary_number_op(stack,|left_num,right_num|Value::Integer(left_num+right_num),|left_num,right_num|Value::Integer(left_num+right_num));
         }
         BuiltIn::SUBTRACT => {
-            binary_number_op(stack,|left_num,right_num|Value::Number(left_num-right_num));
+            binary_number_op(stack,|left_num,right_num|Value::Integer(left_num-right_num),|left_num,right_num|Value::Integer(left_num-right_num));
         }
         BuiltIn::MULTIPLY => {
-            binary_number_op(stack,|left_num,right_num|Value::Number(left_num*right_num));
+            binary_number_op(stack,|left_num,right_num|Value::Integer(left_num*right_num),|left_num,right_num|Value::Integer(left_num*right_num));
         }
-        BuiltIn::DIVIDE => {
-            binary_number_op(stack,|left_num,right_num|Value::Number(left_num/right_num));
+        BuiltIn::FLOOR_DIVIDE => {
+            binary_number_op(stack,|left_num,right_num|Value::Integer(left_num/right_num),|left_num,right_num|Value::Integer(left_num/right_num));
         }
         BuiltIn::MODULO => {
-            binary_number_op(stack,|left_num,right_num|Value::Number(left_num%right_num));
+            binary_number_op(stack,|left_num,right_num|Value::Integer(left_num*right_num),|left_num,right_num|Value::Integer(left_num*right_num));
         }
+        // TODO make negative powers result in Float value
+        BuiltIn::POW => {
+            binary_number_op(stack,
+                |left_num,right_num|Value::Integer(if *right_num < 0 {Integer::from(0)} else {left_num.pow(right_num.to_u32().unwrap())}),
+                |left_num,mut right_num|{Value::Integer(if right_num < 0 { Integer::from(0)} else {right_num.assign(left_num.pow(right_num.to_u32().unwrap()));right_num})});
+        }
+        // TODO? pow_mod
         BuiltIn::LEN => {
             let val = stack.pop().unwrap_or_default();
             let length = match val {
-                // TODO is this a useful value
-                Value::Number(num) => (num.abs()+1.0).log2().ceil()+(if num<0. {1.} else {0.}),
-                Value::List(elts) => elts.len() as f64,
-                Value::Quotation(body) => body.len() as f64
+                Value::Integer(num) => num.significant_bits() as u64,
+                Value::List(elts) => elts.len() as u64,
+                Value::Quotation(body) => body.len() as u64
             };
-            stack.push(Value::Number(length));
+            stack.push(Value::Integer(Integer::from(length)));
         }
         BuiltIn::COLLECT1 => {
             op_collect(stack,1);
@@ -903,8 +957,9 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
         BuiltIn::COLLECT => {
             let size = stack.pop().unwrap_or_default();
             match size {
-                Value::Number(num) => {
-                    op_collect(stack,num.round_ties_even() as i64);
+                Value::Integer(num) => {
+                    // panic if stack count does not fit in i64
+                    op_collect(stack,num.to_i64().unwrap());
                 }
                 Value::List(_elts) => {panic!("collect count cannot be a list");}
                 Value::Quotation(body) => {
@@ -978,14 +1033,14 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
 fn eval_block<'a>(atoms: &'a [Atom<'a>],stack: &mut Vec<Value<'a>>,globals: &mut HashMap<&'a [u8],Value<'a>>){
     for atom in atoms {
         match atom {
-            Atom::Number(num) => {
-                stack.push(Value::Number(*num))
+            Atom::Integer(num) => {
+                stack.push(Value::Integer(num.clone()))
             }
             Atom::Chars(val) => {
-                escaped_char_iter(val).for_each(|c|stack.push(Value::Number(c as f64)))
+                escaped_char_iter(val).for_each(|c|stack.push(Value::Integer(Integer::from(c))))
             }
             Atom::String(val) => {
-                stack.push(Value::List(escaped_char_iter(val).map(|c|Value::Number(c as f64)).collect()))
+                stack.push(Value::List(escaped_char_iter(val).map(|c|Value::Integer(Integer::from(c))).collect()))
             }
             Atom::Quotation(body) => {
                 stack.push(Value::Quotation(body))

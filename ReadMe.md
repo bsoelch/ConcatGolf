@@ -10,6 +10,7 @@ store the source code in `./in.txt` use the command `cargo run` to build and run
 ## TODOs
 
 - [x] create human-readable language
+- [ ] support arbitary precission numbers
 - [ ] support all built-in operators
 - [ ] operators for list manipulation
 - [ ] compressed byte-code
