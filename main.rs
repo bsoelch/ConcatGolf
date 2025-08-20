@@ -907,8 +907,10 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
                     op_collect(stack,num.round_ties_even() as i64);
                 }
                 Value::List(_elts) => {panic!("collect count cannot be a list");}
-                Value::Quotation(_body) => {
-                    panic!("collect count cannot be a quotation");
+                Value::Quotation(body) => {
+                    let mut elts = Vec::with_capacity(body.len());
+                    eval_block(body,&mut elts,globals);
+                    stack.push(Value::List(elts))
                 }
             };
         }
