@@ -185,8 +185,13 @@ enum BuiltIn {
     MAP,
 
     CALL,
+
+    PRINT,
+    PRINTLN,
+    PRINT_ALL,
+    PRINTLN_ALL,
 }
-const BUILTIN_WORDS: [(&[u8],BuiltIn); 51] = [
+const BUILTIN_WORDS: [(&[u8],BuiltIn); 55] = [
     // stack manipulation
     (b"dup", BuiltIn::DUP),
     (b"dup2", BuiltIn::DUP2),
@@ -244,6 +249,11 @@ const BUILTIN_WORDS: [(&[u8],BuiltIn); 51] = [
     // functions
     (b"()", BuiltIn::CALL),
     (b"call", BuiltIn::CALL),
+    // io
+    (b"print", BuiltIn::PRINT),
+    (b"println", BuiltIn::PRINTLN),
+    (b"print*", BuiltIn::PRINT_ALL),
+    (b"print*ln", BuiltIn::PRINTLN_ALL),
 ];
 static BUILTIN_INFO: OnceLock<HashMap<&[u8],BuiltIn>> = OnceLock::new();
 static BUILTIN_NAMES: OnceLock<HashMap<BuiltIn,&[u8]>> = OnceLock::new();
@@ -670,6 +680,45 @@ impl ToString for Value<'_> {
         }
     }
 }
+fn value_string<'a>(buf: &mut String,val: Value<'a>) {
+    match val {
+        Value::Number(num) => {
+            let char_id = num.round();
+            buf.push(char::from_u32(char_id as u32).unwrap_or('\u{FFFD}'));
+        }
+        // TODO? print (part of) body
+        Value::Quotation(_code) => {
+            buf.push_str("Quotation: {...}")
+        }
+        _ => {
+            for elt in as_iter(val) {
+                value_string(buf,elt);
+            }
+        }
+    }
+}
+fn elements_string<'a>(buf: &mut String,val: Value<'a>) {
+    match val {
+        Value::Number(num) => {
+            buf.push_str(&format!("{}",num));
+        }
+        // TODO? print (part of) body
+        Value::Quotation(_code) => {
+            buf.push_str("Quotation: {...}")
+        }
+        _ => {
+            buf.push('[');
+            let mut first = true;
+            for elt in as_iter(val) {
+                if !first { buf.push(','); }
+                first = false;
+                elements_string(buf,elt);
+            }
+            buf.push(']');
+        }
+    }
+}
+
 fn unary_number_op0<'a>(val: Value<'a>,f: &dyn Fn(f64)->Value<'a>) -> Value<'a> {
     match val {
         Value::Number(num) => f(num),
@@ -1012,6 +1061,30 @@ fn eval_buitlt_in<'a>(built_in: BuiltIn,stack: &mut Vec<Value<'a>>,globals: &mut
         BuiltIn::CALL => {
             let val = stack.pop().unwrap_or_default();
             eval_call(&val,stack,globals);
+        }
+        BuiltIn::PRINT => {
+            let val = stack.pop().unwrap_or_default();
+            let mut buf = String::new();
+            value_string(&mut buf,val);
+            println!("{}",buf);
+        }
+        BuiltIn::PRINTLN => {
+            let val = stack.pop().unwrap_or_default();
+            let mut buf = String::new();
+            value_string(&mut buf,val);
+            println!("{}\n",buf);
+        }
+        BuiltIn::PRINT_ALL => {
+            let val = stack.pop().unwrap_or_default();
+            let mut buf = String::new();
+            elements_string(&mut buf,val);
+            println!("{}",buf);
+        }
+        BuiltIn::PRINTLN_ALL => {
+            let val = stack.pop().unwrap_or_default();
+            let mut buf = String::new();
+            elements_string(&mut buf,val);
+            println!("{}\n",buf);
         }
         _ => panic!("unimplemented: {}",String::from_utf8_lossy(builtin_name(&built_in).unwrap()))
     }
